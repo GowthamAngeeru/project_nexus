@@ -1,0 +1,24 @@
+# --- Security ---
+.env
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+pip-log.txt
+
+# --- Rust (AetherOS Gateway) ---
+aetheros_gateway/target/
+**/*.rs.bk
+
+# --- OS & IDE ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
