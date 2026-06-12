@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package nexus;
+
+service RouterService {
+    rpc RouteTask (RouterRequest) returns (RouterResponse);
+}
+
+message RouterRequest{
+    string user_id = 1;
+    string prompt = 2;
+}
+
+message RouterResponse {
+    string status =1;
+    string selected_route = 2;
+    float complexity_score =3;
+    float execution_time_ms =4;
+}
+
+service SwarmService {
+    rpc ExecuteSwarmTask (SwarmRequest) returns (SwarmResponse);
+}
+
+message SwarmRequest{
+    string user_id =1;
+    string prompt = 2;
+}
+
+message SwarmResponse{
+    string status =1;
+    repeated string agent_trace =2;
+    string final_output =3;
+    float execution_time_ms =4;
+}
