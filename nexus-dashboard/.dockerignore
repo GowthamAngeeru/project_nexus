@@ -1,0 +1,23 @@
+# Git History (The likely 85MB culprit)
+.git/
+**/.git/
+
+# Node/Next.js
+**/node_modules/
+**/.next/
+**/out/
+**/dist/
+
+# Python
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+
+# Rust
+**/target/
+**/*.rs.bk
+
+# IDE and Secrets
+**/.vscode/
+**/.env

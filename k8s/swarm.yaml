@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swarm-deployment
+  labels:
+    app: nexus-swarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexus-swarm
+  template:
+    metadata:
+      labels:
+        app: nexus-swarm
+    spec:
+      containers:
+        - name: swarm
+          image: nexus-swarm:production
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-c"]
+          args:
+            [
+              "pip install langgraph langchain-openai langchain protobuf>=6.33.5 && python /app/cognitive_swarm/main.py",
+            ]
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-secret
+                  key: api-key
+            # 🌉 The Bridge to your Windows Ollama!
+            - name: OLLAMA_HOST
+              value: "http://172.17.0.1:11434"
+            - name: OLLAMA_BASE_URL
+              value: "http://172.17.0.1:11434"
+        # 🥷 THE SIDECAR
+        - name: redis-proxy
+          image: alpine:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            [
+              "apk add --no-cache socat && socat TCP-LISTEN:6379,fork TCP:redis:6379",
+            ]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-swarm
+spec:
+  selector:
+    app: nexus-swarm
+  ports:
+    - protocol: TCP
+      port: 8002
+      targetPort: 8002

@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+grpcio
+grpcio-tools
+qdrant-client
+sentence-transformers
+redis
+python-dotenv

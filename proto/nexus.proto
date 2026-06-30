@@ -33,3 +33,33 @@ message SwarmResponse{
     string final_output =3;
     float execution_time_ms =4;
 }
+
+service EvaluationService {
+    rpc EvaluateResponse (EvaluationRequest) returns (EvaluationResponse);
+    rpc BatchEvaluate (BatchEvaluationRequest) returns (BatchEvaluationResponse);
+}
+
+message EvaluationRequest {
+    string question   = 1;
+    string answer     = 2;
+    string context    = 3;
+    string agent_name = 4;
+    string request_id = 5;
+}
+
+message EvaluationResponse {
+    float  trust_score        = 1;
+    float  faithfulness_score = 2;
+    float  relevancy_score    = 3;
+    float  hallucination_risk = 4;
+    string verdict            = 5;
+    string reasoning          = 6;
+}
+
+message BatchEvaluationRequest {
+    repeated EvaluationRequest items = 1;
+}
+
+message BatchEvaluationResponse {
+    repeated EvaluationResponse results = 1;
+}

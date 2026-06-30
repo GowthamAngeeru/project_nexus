@@ -1,0 +1,50 @@
+---
+# 1. The Deployment: Manages the Next.js UI Pods
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard-deployment
+  labels:
+    app: nexus-dashboard
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nexus-dashboard
+  template:
+    metadata:
+      labels:
+        app: nexus-dashboard
+    spec:
+      containers:
+        - name: dashboard
+          image: nexus-dashboard:production
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 3000
+          env:
+            # THE MAGIC FIX: Tell Next.js to accept external connections
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            # Tell the server-side Next.js code how to find the Rust Gateway inside the cluster
+            - name: INTERNAL_GATEWAY_URL
+              value: "http://nexus-gateway:8080"
+            # Tell the client-side browser code how to find the Rust Gateway from outside
+            - name: NEXT_PUBLIC_API_URL
+              value: "http://localhost:30080"
+
+---
+# 2. The Service: The Public Network Bridge
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-dashboard
+spec:
+  type: NodePort
+  selector:
+    app: nexus-dashboard
+  ports:
+    - protocol: TCP
+      port: 3000
+      targetPort: 3000
+      nodePort: 30000

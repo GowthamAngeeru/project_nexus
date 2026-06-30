@@ -1,0 +1,5 @@
+.venv/
+node_modules/
+aetheros_gateway/target/
+**/*.rs.bk
+.env

@@ -1,13 +1,18 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use dashmap::DashMap;
-use reqwest::Client as HttpClient;
+use axum::{routing::post, Json, Router};
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::env;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use tower_http::cors::{Any, CorsLayer};
+
+pub mod nexus {
+    tonic::include_proto!("nexus");
+}
+use nexus::router_service_client::RouterServiceClient;
+use nexus::swarm_service_client::SwarmServiceClient;
+use nexus::{RouterRequest, SwarmRequest};
 
 #[derive(Deserialize)]
-struct AIRequest {
+struct IncomingRequest {
     user_id: String,
     prompt: String,
 }
@@ -16,173 +21,173 @@ struct AIRequest {
 struct GatewayResponse {
     status: String,
     source: String,
-    message: String,
-    latency_ms: u128,
+    final_output: String,
+    gateway_latency_ms: f64,
+    routing_confidence: f32,
 }
 
+#[derive(Clone)]
 struct AppState {
-    rate_limiter: DashMap<String, (u32, Instant)>,
-    semantic_cache: DashMap<String, (Vec<f32>, String)>,
-    http_client: HttpClient,
-    openai_key: String,
+    redis_conn: redis::aio::MultiplexedConnection,
+    router_client: RouterServiceClient<tonic::transport::Channel>,
+    swarm_client: SwarmServiceClient<tonic::transport::Channel>,
 }
 
-fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
-    let dot: f32 = v1.iter().zip(v2).map(|(a, b)| a * b).sum();
-    let mag1: f32 = v1.iter().map(|a| a * a).sum::<f32>().sqrt();
-    let mag2: f32 = v2.iter().map(|b| b * b).sum::<f32>().sqrt();
-    if mag1 == 0.0 || mag2 == 0.0 {
-        0.0
-    } else {
-        dot / (mag1 * mag2)
-    }
-}
-
-async fn get_embedding(client: &HttpClient, key: &str, text: &str) -> Vec<f32> {
-    let res = client
-        .post("https://api.openai.com/v1/embeddings")
-        .bearer_auth(key)
-        .json(&json!({
-            "input": text,
-            "model": "text-embedding-3-small"
-        }))
-        .send()
-        .await
-        .expect("Failed to connect to OpenAI")
-        .json::<serde_json::Value>()
-        .await
-        .expect("Failed to parse OpenAI response");
-
-    res["data"][0]["embedding"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_f64().unwrap() as f32)
-        .collect()
-}
-
-async fn process_prompt(
-    req_body: web::Json<AIRequest>,
-    state: web::Data<AppState>,
-) -> impl Responder {
+async fn handle_request(
+    axum::extract::State(data): axum::extract::State<AppState>,
+    Json(req): Json<IncomingRequest>,
+) -> Result<Json<GatewayResponse>, axum::http::StatusCode> {
     let start_time = Instant::now();
+    let prompt = req.prompt.clone();
+    let user_id = req.user_id.clone();
+    let mut redis_conn = data.redis_conn.clone();
 
-    let now = Instant::now();
-    let mut user_record = state
-        .rate_limiter
-        .entry(req_body.user_id.clone())
-        .or_insert((0, now));
-    if now.duration_since(user_record.value().1) > Duration::from_secs(10) {
-        user_record.value_mut().0 = 0;
-        user_record.value_mut().1 = now;
+    // L2 Redis cache check
+    let cached_output: redis::RedisResult<Option<String>> = redis_conn.get(&prompt).await;
+    if let Ok(Some(output)) = cached_output {
+        let latency = start_time.elapsed().as_secs_f64() * 1000.0;
+        return Ok(Json(GatewayResponse {
+            status: "success".to_string(),
+            source: "L2_REDIS_CACHE".to_string(),
+            final_output: output,
+            gateway_latency_ms: latency,
+            routing_confidence: 1.0,
+        }));
     }
-    if user_record.value().0 >= 5 {
-        return HttpResponse::TooManyRequests().json(GatewayResponse {
-            status: "error".to_string(),
-            source: "aetheros_shield".to_string(),
-            message: "Rate limit exceeded.".to_string(),
-            latency_ms: start_time.elapsed().as_millis(),
-        });
-    }
-    user_record.value_mut().0 += 1;
 
-    println!("🧠 Generating vector embedding for incoming request...");
-    let user_embedding =
-        get_embedding(&state.http_client, &state.openai_key, &req_body.prompt).await;
+    // Use pre-built client from AppState — no new connection per request
+    let mut router_client = data.router_client.clone();
 
-    for entry in state.semantic_cache.iter() {
-        let (cached_vec, cached_answer) = entry.value();
-        let similarity = cosine_similarity(&user_embedding, cached_vec);
-
-        if similarity > 0.90 {
-            println!(
-                "⚡ SEMANTIC CACHE HIT (Score: {:.2}): Saving cluster resources!",
-                similarity
-            );
-            return HttpResponse::Ok().json(GatewayResponse {
-                status: "success".to_string(),
-                source: "l1_vector_cache".to_string(),
-                message: cached_answer.clone(),
-                latency_ms: start_time.elapsed().as_millis(),
-            });
+    let router_res = match router_client
+        .route_task(tonic::Request::new(RouterRequest {
+            user_id: user_id.clone(),
+            prompt: prompt.clone(),
+        }))
+        .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(e) => {
+            eprintln!("Router gRPC error: {}", e);
+            return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         }
-    }
-
-    println!("🔍 CACHE MISS: Asking Python Router (Port 8001) for directions...");
-
-    let router_res = state
-        .http_client
-        .post("http://127.0.0.1:8001/api/v1/route")
-        .json(&json!({ "user_id": req_body.user_id, "prompt": req_body.prompt }))
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
-
-    let selected_route = router_res["selected_route"]
-        .as_str()
-        .unwrap_or("local_fast_llm");
-
-    let final_answer = if selected_route == "cognitive_agent_swarm" {
-        println!("🚀 ROUTER DIRECTS TO SWARM. Forwarding to Port 8002...");
-
-        let swarm_res = state
-            .http_client
-            .post("http://127.0.0.1:8002/api/v1/swarm/execute")
-            .json(&json!({ "user_id": req_body.user_id, "prompt": req_body.prompt }))
-            .send()
-            .await
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap();
-
-        swarm_res["final_output"]
-            .as_str()
-            .unwrap_or("Swarm processing failed.")
-            .to_string()
-    } else {
-        println!("⚡ ROUTER DIRECTS TO LOCAL LLM. (Simulating fast local answer)...");
-        format!("Simulated Fast LLM Answer for: {}", req_body.prompt)
     };
 
-    state.semantic_cache.insert(
-        req_body.prompt.clone(),
-        (user_embedding, final_answer.clone()),
-    );
+    let source = router_res.selected_route.clone();
+    let final_output: String;
 
-    HttpResponse::Ok().json(GatewayResponse {
+    if router_res.selected_route == "COGNITIVE_SWARM" {
+        // Use pre-built swarm client — no new connection per request
+        let mut swarm_client = data.swarm_client.clone();
+
+        let swarm_res = match swarm_client
+            .execute_swarm_task(tonic::Request::new(SwarmRequest {
+                user_id: user_id.clone(),
+                prompt: prompt.clone(),
+            }))
+            .await
+        {
+            Ok(res) => res.into_inner(),
+            Err(e) => {
+                eprintln!("Swarm gRPC error: {}", e);
+                return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        final_output = swarm_res.final_output;
+    } else {
+        let ollama_url =
+            std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "model": "tinyllama",
+            "messages": [
+                {"role": "system", "content": "You are a fast, concise AI. Answer briefly."},
+                {"role": "user", "content": &prompt}
+            ],
+            "stream": false
+        });
+
+        final_output = match client
+            .post(format!("{}/api/chat", ollama_url))
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                if let Ok(json) = response.json::<serde_json::Value>().await {
+                    json["message"]["content"]
+                        .as_str()
+                        .unwrap_or("Failed to parse Ollama response.")
+                        .to_string()
+                } else {
+                    "Error parsing local LLM response.".to_string()
+                }
+            }
+            Err(_) => "Local LLM unavailable. Is Ollama running?".to_string(),
+        };
+    }
+
+    let _: redis::RedisResult<()> = redis_conn.set(&prompt, &final_output).await;
+    let latency = start_time.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(Json(GatewayResponse {
         status: "success".to_string(),
-        source: format!("computed_by_{}", selected_route),
-        message: final_answer,
-        latency_ms: start_time.elapsed().as_millis(),
-    })
+        source,
+        final_output,
+        gateway_latency_ms: latency,
+        routing_confidence: router_res.complexity_score,
+    }))
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    println!("==================================================");
-    println!("🚀 BOOTING PROJECT NEXUS: AetherOS Master Gateway");
-    println!("==================================================");
+#[tokio::main]
+async fn main() {
+    dotenvy::dotenv().ok();
 
-    let openai_key = env::var("OPENAI_API_KEY")
-        .expect("🚨 FATAL: OPENAI_API_KEY environment variable is required!");
+    println!("Booting Nexus Gateway...");
 
-    let app_state = web::Data::new(AppState {
-        rate_limiter: DashMap::new(),
-        semantic_cache: DashMap::new(),
-        http_client: HttpClient::new(),
-        openai_key,
-    });
+    // Redis connection
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_client = redis::Client::open(redis_url).expect("Invalid Redis URL");
+    let redis_conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("Redis connection failed");
+    println!("Redis connected.");
 
-    HttpServer::new(move || {
-        App::new()
-            .app_data(app_state.clone())
-            .route("/api/v1/generate", web::post().to(process_prompt))
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
+    // Build gRPC clients ONCE at startup — reused across all requests
+    let router_url =
+        std::env::var("ROUTER_URL").unwrap_or_else(|_| "http://127.0.0.1:8001".to_string());
+    let router_client = RouterServiceClient::connect(router_url.clone())
+        .await
+        .unwrap_or_else(|e| panic!("Cannot connect to router at {}: {}", router_url, e));
+    println!("Router client connected: {}", router_url);
+
+    let swarm_url =
+        std::env::var("SWARM_URL").unwrap_or_else(|_| "http://127.0.0.1:8002".to_string());
+    let swarm_client = SwarmServiceClient::connect(swarm_url.clone())
+        .await
+        .unwrap_or_else(|e| panic!("Cannot connect to swarm at {}: {}", swarm_url, e));
+    println!("Swarm client connected: {}", swarm_url);
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/api/v1/chat", post(handle_request))
+        .layer(cors)
+        .with_state(AppState {
+            redis_conn,
+            router_client, // ← passed into state
+            swarm_client,  // ← passed into state
+        });
+
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+    println!("Gateway online: {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }

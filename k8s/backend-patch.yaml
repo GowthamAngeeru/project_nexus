@@ -1,0 +1,154 @@
+# ==========================================
+# 1. GATEWAY FIX (Adding Redis Sidecar Proxy)
+# ==========================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-deployment
+  labels:
+    app: nexus-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexus-gateway
+  template:
+    metadata:
+      labels:
+        app: nexus-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: nexus-gateway:production
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+        # 🥷 THE SIDECAR: Intercepts localhost:6379 and forwards to the real Redis!
+        - name: redis-proxy
+          image: alpine:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            [
+              "apk add --no-cache socat && socat TCP-LISTEN:6379,fork TCP:redis:6379",
+            ]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-gateway
+spec:
+  selector:
+    app: nexus-gateway
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+
+---
+# ==========================================
+# 2. ROUTER FIX (Adding Qdrant & Redis Proxies)
+# ==========================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router-deployment
+  labels:
+    app: nexus-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexus-router
+  template:
+    metadata:
+      labels:
+        app: nexus-router
+    spec:
+      containers:
+        - name: router
+          image: nexus-router:production
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8001
+        # 🥷 SIDECAR 1: Intercepts Qdrant requests
+        - name: qdrant-proxy
+          image: alpine:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            [
+              "apk add --no-cache socat && socat TCP-LISTEN:6333,fork TCP:qdrant:6333",
+            ]
+        # 🥷 SIDECAR 2: Intercepts Redis requests
+        - name: redis-proxy
+          image: alpine:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            [
+              "apk add --no-cache socat && socat TCP-LISTEN:6379,fork TCP:redis:6379",
+            ]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-router
+spec:
+  selector:
+    app: nexus-router
+  ports:
+    - protocol: TCP
+      port: 8001
+      targetPort: 8001
+
+---
+# ==========================================
+# 3. SWARM FIX (Adding Redis Proxy & Upgrading Protobuf)
+# ==========================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swarm-deployment
+  labels:
+    app: nexus-swarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nexus-swarm
+  template:
+    metadata:
+      labels:
+        app: nexus-swarm
+    spec:
+      containers:
+        - name: swarm
+          image: nexus-swarm:production
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-c"]
+          # 🥷 THE FINAL HACK: Upgrading protobuf to >=6.33.5 alongside the AI libs!
+          args:
+            [
+              "pip install langgraph langchain-openai langchain protobuf>=6.33.5 && python /app/cognitive_swarm/main.py",
+            ]
+          env:
+            - name: OPENAI_API_KEY
+              value: "sk-proj-YOUR_API_KEY_HERE"
+        # 🥷 THE SIDECAR: Intercepts Redis requests
+        - name: redis-proxy
+          image: alpine:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            [
+              "apk add --no-cache socat && socat TCP-LISTEN:6379,fork TCP:redis:6379",
+            ]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-swarm
+spec:
+  selector:
+    app: nexus-swarm
+  ports:
+    - protocol: TCP
+      port: 8002
+      targetPort: 8002

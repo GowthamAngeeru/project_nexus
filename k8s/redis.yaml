@@ -1,0 +1,37 @@
+---
+# 1. The Deployment: Run the Redis container
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-deployment
+  labels:
+    app: redis
+spec:
+  replicas: 1 # Run exactly 1 copy of Redis
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:alpine # Pull the tiny, official Redis image
+          ports:
+            - containerPort: 6379
+
+---
+# 2. The Service: Give Redis a permanent internal network address
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis # This is the DNS name the other apps will use to find it!
+spec:
+  selector:
+    app: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
